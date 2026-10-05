@@ -10,5 +10,7 @@ Using 640X360 substreams this uses very little resources.
 - Silent retry on transient startup errors
 - Click tile → new Waterfox tab via go2rtc WebRTC
 - pan/tilt controls via SSH motors command
+- Use camsidebar.desktop to create launch button
+- 
 
 <img width="1920" height="1080" alt="Screenshot From 2026-10-05 11-34-58" src="https://github.com/user-attachments/assets/a7ef68a9-843f-46bf-abef-97e4998f27b9" />
