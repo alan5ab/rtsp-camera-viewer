@@ -389,6 +389,8 @@ If you want a larger preview grid, you can adjust:
 THUMB_W, THUMB_H = 256, 144
 ```
 
+## Human explanation: Copy script to your PC, make changes applicable to your hardware, install dependencies, run
+
 ## License
 
 This project is licensed under the MIT License. See the `LICENSE` file in this repository for details.
