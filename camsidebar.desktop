@@ -1,0 +1,13 @@
+  GNU nano 8.7.1  /home/al/.local/share/applications/camsidebar.desktop *         
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Cameras Vertical
+Comment=RTSP Camera Viewer - Vertical
+Exec=python3 /home/al/camsidebar.py
+Icon=camera-web
+Terminal=false
+Categories=AudioVideo;Video;
+StartupNotify=true
+StartupWMClass=cameras-vertical
+
