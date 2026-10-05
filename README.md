@@ -1,2 +1,10 @@
 # rtsp-camera-viewer
 side bar camera viewer
+Ubuntu 24.04/26.04 Wayland
+
+- Hardware decode via Intel VA-API (vaapih264dec)
+- go2rtc substreams at 640x360, scaled to 256x144 for thumbnails
+- 2-second stagger between camera startups
+- Silent retry on transient startup errors
+- Click tile → new Waterfox tab via go2rtc WebRTC
+- CC has pan/tilt controls via SSH motors command
