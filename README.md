@@ -1,7 +1,7 @@
 # rtsp-camera-viewer
-desk top side bar camera viewer
+desk-top vertical side bar camera viewer
 Ubuntu 24.04/26.04 Wayland example
-You must have go2rtc installed, and set your hardware decoder
+You must have go2rtc installed, and set your hardware decoder and camera urls
 Using 640X360 substreams this uses very little resources.
 
 - Hardware decode via Intel VA-API (vaapih264dec)
