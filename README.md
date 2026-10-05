@@ -1,7 +1,5 @@
 # rtsp-camera-viewer
 
-![RTSP Camera Viewer](./rtsp-camera-viewer-screenshot.svg)
-
 Desktop-side vertical webcam viewer for Ubuntu 24.04/26.04 Wayland. This project shows a slim column of camera thumbnails, reconnects automatically, and opens a full browser view for any camera when you click its tile.
 
 It is intended to work with go2rtc and RTSP streams, using lightweight 640x360 substreams for the desktop sidebar. The app can use Intel VA-API, NVIDIA NVDEC, AMD VCE, or a pure software decoder fallback.
