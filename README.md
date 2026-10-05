@@ -1,5 +1,7 @@
 # rtsp-camera-viewer
 
+![RTSP Camera Viewer](./rtsp-camera-viewer-screenshot.svg)
+
 Desktop-side vertical webcam viewer for Ubuntu 24.04/26.04 Wayland. This project shows a slim column of camera thumbnails, reconnects automatically, and opens a full browser view for any camera when you click its tile.
 
 It is intended to work with go2rtc and RTSP streams, using lightweight 640x360 substreams for the desktop sidebar. The app can use Intel VA-API, NVIDIA NVDEC, AMD VCE, or a pure software decoder fallback.
@@ -381,7 +383,7 @@ firefox http://127.0.0.1:1984/stream.html?mode=webrtc&src=RFC
 
 ## Performance notes
 
-This app is intended for a modest number of cameras. The thumbnail pipeline uses low-resolution substreams and a staggered start to avoid large resource spikes. By default the app uses 256x144 thumbnails and starts each camera 2 seconds apart.
+This app is intended for a modest number of cameras. The thumbnail pipeline uses low-resolution substreams and a staggered start to avoid large resource spikes. By default the app uses 256x144 thumbnail streams for responsiveness.
 
 If you want a larger preview grid, you can adjust:
 
