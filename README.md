@@ -1,5 +1,5 @@
 # rtsp-camera-viewer
-side bar camera viewer
+desk top side bar camera viewer
 Ubuntu 24.04/26.04 Wayland
 
 - Hardware decode via Intel VA-API (vaapih264dec)
@@ -7,4 +7,4 @@ Ubuntu 24.04/26.04 Wayland
 - 2-second stagger between camera startups
 - Silent retry on transient startup errors
 - Click tile → new Waterfox tab via go2rtc WebRTC
-- CC has pan/tilt controls via SSH motors command
+- pan/tilt controls via SSH motors command
