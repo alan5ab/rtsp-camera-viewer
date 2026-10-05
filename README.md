@@ -11,3 +11,4 @@ Using 640X360 substreams this uses very little resources.
 - Click tile → new Waterfox tab via go2rtc WebRTC
 - pan/tilt controls via SSH motors command
 
+<img width="1920" height="1080" alt="Screenshot From 2026-10-05 11-34-58" src="https://github.com/user-attachments/assets/a7ef68a9-843f-46bf-abef-97e4998f27b9" />
