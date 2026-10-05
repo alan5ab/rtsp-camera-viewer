@@ -391,7 +391,7 @@ THUMB_W, THUMB_H = 256, 144
 
 ## License
 
-This project currently does not specify a license in the repository. If you plan to distribute it publicly, add a license such as MIT or GPL.
+This project is licensed under the MIT License. See the `LICENSE` file in this repository for details.
 
 ## Contributing
 
