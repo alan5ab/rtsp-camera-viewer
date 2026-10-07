@@ -391,7 +391,7 @@ THUMB_W, THUMB_H = 256, 144
 
 ## Human explanation: 
 
-Copy script to your PC, make changes applicable to your hardware, install dependencies, run
+Assuming you already have go2rtc installed, Copy script to your PC, make changes applicable to your hardware, change urls and set permissions, install dependencies, run
 
 ## Changes:
 
