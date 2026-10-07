@@ -45,13 +45,19 @@ CAMERAS = [
 
 THUMB_W, THUMB_H = 256, 144
 
-RECONNECT_DELAY = 7
-STARTUP_RETRY = 3
-STAGGER_DELAY = 2
+RECONNECT_DELAY      = 7    # seconds before reconnect after error
+STARTUP_RETRY        = 3    # seconds before silent retry on startup error
+STAGGER_DELAY        = 2    # seconds between each camera starting
+PERIODIC_RECONNECT   = 0    # seconds — force reconnect on schedule (0 = disabled)
+FREEZE_DETECT        = 10   # seconds — reconnect if no new frame received (0 = disabled)
 
 GO2RTC_BASE = (
     "http://192.168.254.4:1984/stream.html?mode=webrtc&src="
 )
+
+# Set by installer — change manually if needed
+BROWSER = "waterfox"   # waterfox | firefox | chromium | google-chrome
+DECODER = "vaapih264dec"  # decodebin | vaapih264dec | nvh264dec
 
 
 # PTZ camera SSH config — add all 4 P/T cameras here
@@ -90,10 +96,10 @@ def _unique_sink_name():
     return f"sink{_sink_counter}"
 
 
-def open_in_waterfox(go2rtc_name: str):
+def open_in_browser(go2rtc_name: str):
     """Open the go2rtc WebRTC stream page as a new tab."""
     subprocess.Popen(
-        ["waterfox", "--new-tab", GO2RTC_BASE + go2rtc_name],
+        [BROWSER, "--new-tab", GO2RTC_BASE + go2rtc_name],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
@@ -176,12 +182,46 @@ class CameraStream(GObject.Object):
 
         super().__init__()
 
-        self.url = url
-        self._pipe = None
-        self._retry = None
-        self._has_frame = False
+        self.url           = url
+        self._pipe         = None
+        self._retry        = None
+        self._refresh      = None   # periodic reconnect timer
+        self._freeze_timer = None   # freeze watchdog timer
+        self._has_frame    = False
 
         self._build()
+
+    def _reset_freeze_timer(self):
+        """Restart the freeze watchdog — called on every new frame."""
+        if FREEZE_DETECT <= 0:
+            return
+        if self._freeze_timer:
+            GLib.source_remove(self._freeze_timer)
+        self._freeze_timer = GLib.timeout_add_seconds(
+            FREEZE_DETECT, self._on_freeze
+        )
+
+    def _on_freeze(self):
+        """No frame received in FREEZE_DETECT seconds — stream is frozen."""
+        self._freeze_timer = None
+        print(f"[freeze] {self.url} — reconnecting", flush=True)
+        self._schedule_reconnect("frozen", startup=False)
+        return GLib.SOURCE_REMOVE
+
+    def _start_periodic(self):
+        """Start a periodic forced reconnect to prevent freeze."""
+        if PERIODIC_RECONNECT > 0 and self._refresh is None:
+            self._refresh = GLib.timeout_add_seconds(
+                PERIODIC_RECONNECT, self._do_periodic
+            )
+
+    def _do_periodic(self):
+        """Force pipeline restart on schedule regardless of stream state."""
+        self._refresh = None
+        self._stop()
+        self._has_frame = False
+        self._build()
+        return GLib.SOURCE_REMOVE
 
     def _build(self):
 
@@ -192,7 +232,7 @@ class CameraStream(GObject.Object):
             f"latency=100 drop-on-latency=true "
             f"do-rtsp-keep-alive=true ! "
             f"rtph264depay ! h264parse ! "
-            f"vaapih264dec ! "
+            f"{DECODER} ! "
             f"videoconvert ! videoscale ! "
             f"video/x-raw,width={THUMB_W},height={THUMB_H} ! "
             f"gtk4paintablesink name={sink_name} sync=false"
@@ -227,6 +267,15 @@ class CameraStream(GObject.Object):
                 paintable
             )
 
+            # Probe every frame to drive freeze detection
+            sink_pad = sink.get_static_pad("sink")
+            if sink_pad:
+                sink_pad.add_probe(
+                    Gst.PadProbeType.BUFFER,
+                    self._on_buffer,
+                    None
+                )
+
         bus = self._pipe.get_bus()
 
         bus.add_signal_watch()
@@ -245,9 +294,20 @@ class CameraStream(GObject.Object):
             Gst.State.PLAYING
         )
 
+    def _on_buffer(self, pad, info, data):
+        """Called on every decoded frame — resets freeze watchdog."""
+        if self._has_frame:
+            GLib.idle_add(self._reset_freeze_timer)
+        return Gst.PadProbeReturn.OK
+
     def _emit_paintable(self, paintable):
 
-        self._has_frame = True
+        if not self._has_frame:
+            # First frame — start freeze watchdog now
+            self._has_frame = True
+            self._start_periodic()
+
+        self._reset_freeze_timer()
 
         self.emit(
             "paintable-ready",
@@ -324,6 +384,10 @@ class CameraStream(GObject.Object):
 
     def _stop(self):
 
+        if self._freeze_timer:
+            GLib.source_remove(self._freeze_timer)
+            self._freeze_timer = None
+
         if self._pipe:
 
             self._pipe.set_state(
@@ -335,12 +399,16 @@ class CameraStream(GObject.Object):
     def destroy(self):
 
         if self._retry:
-
-            GLib.source_remove(
-                self._retry
-            )
-
+            GLib.source_remove(self._retry)
             self._retry = None
+
+        if self._refresh:
+            GLib.source_remove(self._refresh)
+            self._refresh = None
+
+        if self._freeze_timer:
+            GLib.source_remove(self._freeze_timer)
+            self._freeze_timer = None
 
         self._stop()
 
@@ -659,6 +727,8 @@ class RTSPViewer(Gtk.ApplicationWindow):
             title="Cameras"
         )
 
+        self.set_decorated(False)
+
         self.set_default_size(
             THUMB_W,
             1050
@@ -700,7 +770,7 @@ class RTSPViewer(Gtk.ApplicationWindow):
                 "clicked",
                 lambda btn,
                        n=go2rtc_name:
-                    open_in_waterfox(n)
+                    open_in_browser(n)
             )
 
             self._tiles.append(
