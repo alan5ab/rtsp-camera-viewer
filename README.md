@@ -393,6 +393,10 @@ THUMB_W, THUMB_H = 256, 144
 
 Copy script to your PC, make changes applicable to your hardware, install dependencies, run
 
+## Changes:
+
+Removed title bar..must use super key+left mouse button to position. Added freeze detection.
+
 ## License
 
 This project is licensed under the MIT License. See the `LICENSE` file in this repository for details.
