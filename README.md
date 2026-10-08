@@ -130,7 +130,7 @@ rtsp:
 
 streams:
   RFC: "rtsp://192.168.1.100:554/stream1"
-  "230": "rtsp://192.168.1.101:554/stream1"
+  230: "rtsp://192.168.1.101:554/stream1"
   BD: "rtsp://192.168.1.102:554/stream1"
   DC: "rtsp://192.168.1.103:554/stream1"
   CC: "rtsp://192.168.1.104:554/stream1"
@@ -326,7 +326,7 @@ Version=1.0
 Type=Application
 Name=Cameras Vertical
 Comment=RTSP Camera Viewer - Vertical
-Exec=python3 /home/al/camsidebar.py
+Exec=nice _n 10 python3 /home/$user/camsidebar.py
 Icon=camera-web
 Terminal=false
 Categories=AudioVideo;Video;
