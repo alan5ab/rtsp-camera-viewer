@@ -37,10 +37,6 @@ CAMERAS = [
     ("rtsp://127.0.0.1:8554/CC_sub",  "CC",  "CC"),
     ("rtsp://127.0.0.1:8554/SC_sub",  "SC",  "SC"),
     ("rtsp://127.0.0.1:8554/BC_sub", "BC", "BC"),
-    ("rtsp://127.0.0.1:8554/GD_sub", "GD", "GD"),
-    ("rtsp://127.0.0.1:8554/sd_sub", "sd", "sd"),
-    ("rtsp://127.0.0.1:8554/SHOP_sub", "SHOP", "SHOP"),
-    ("rtsp://127.0.0.1:8554/jc_sub",  "jc",  "jc"),
 ]
 
 THUMB_W, THUMB_H = 256, 144
@@ -184,6 +180,7 @@ class CameraStream(GObject.Object):
 
         self.url           = url
         self._pipe         = None
+        self._bus          = None
         self._retry        = None
         self._refresh      = None   # periodic reconnect timer
         self._freeze_timer = None   # freeze watchdog timer
@@ -276,16 +273,16 @@ class CameraStream(GObject.Object):
                     None
                 )
 
-        bus = self._pipe.get_bus()
+        self._bus = self._pipe.get_bus()
 
-        bus.add_signal_watch()
+        self._bus.add_signal_watch()
 
-        bus.connect(
+        self._bus.connect(
             "message::error",
             self._on_error
         )
 
-        bus.connect(
+        self._bus.connect(
             "message::eos",
             self._on_eos
         )
@@ -388,12 +385,12 @@ class CameraStream(GObject.Object):
             GLib.source_remove(self._freeze_timer)
             self._freeze_timer = None
 
+        if self._bus:
+            self._bus.remove_signal_watch()
+            self._bus = None
+
         if self._pipe:
-
-            self._pipe.set_state(
-                Gst.State.NULL
-            )
-
+            self._pipe.set_state(Gst.State.NULL)
             self._pipe = None
 
     def destroy(self):
@@ -415,7 +412,7 @@ class CameraStream(GObject.Object):
 
 # ── Thumbnail tile ─────────────────────────────────────────────────────────────
 
-class CameraTile(Gtk.Button):
+class CameraTile(Gtk.Box):
 
     def __init__(
         self,
@@ -424,7 +421,7 @@ class CameraTile(Gtk.Button):
         label: str
     ):
 
-        super().__init__()
+        super().__init__(orientation=Gtk.Orientation.VERTICAL)
 
         self.index = index
         self.url = url
@@ -437,10 +434,6 @@ class CameraTile(Gtk.Button):
 
         self.add_css_class(
             "camera-tile"
-        )
-
-        self.add_css_class(
-            "flat"
         )
 
         overlay = Gtk.Overlay()
@@ -540,9 +533,7 @@ class CameraTile(Gtk.Button):
             self._placeholder
         )
 
-        self.set_child(
-            overlay
-        )
+        self.append(overlay)
 
     def start_stream(self):
 
@@ -632,22 +623,15 @@ window {
     background-color: #0d0d0d;
 }
 
-button.camera-tile {
+.camera-tile {
     padding: 0;
     border-radius: 0;
     border: 1px solid #252525;
     background: #111;
-    outline: none;
-    box-shadow: none;
 }
 
-button.camera-tile:hover {
+.camera-tile:hover {
     border-color: #4af;
-    background: #111;
-}
-
-button.camera-tile:active {
-    background: #1a1a1a;
 }
 
 .cam-label {
@@ -766,12 +750,14 @@ class RTSPViewer(Gtk.ApplicationWindow):
                 label
             )
 
-            tile.connect(
-                "clicked",
-                lambda btn,
-                       n=go2rtc_name:
-                    open_in_browser(n)
-            )
+            gesture = Gtk.GestureClick()
+            gesture.set_button(1)  # left click only
+            _n = go2rtc_name
+            def _on_click(g, n_press, x, y, name=_n):
+                if n_press == 2:  # double click only
+                    open_in_browser(name)
+            gesture.connect("pressed", _on_click)
+            tile.add_controller(gesture)
 
             self._tiles.append(
                 tile
