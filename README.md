@@ -396,6 +396,7 @@ Assuming you already have go2rtc installed, Copy script to your PC, make changes
 ## Changes:
 
 Removed title bar..must use super key+left mouse button to position. Added freeze detection.
+Changed to doubleclick to open fullscreen, added nice _n 10 to launcher, improve handling of inactive cameras
 
 ## License
 
