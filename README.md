@@ -23,6 +23,13 @@ It is intended to work with go2rtc and RTSP streams, using lightweight 640x360 s
 - go2rtc running locally
 - A browser: Chrome, Chromium, Firefox, or Waterfox
 
+
+## Human explanation: 
+
+Assuming you already have go2rtc installed, Copy script to your PC, make changes applicable to your hardware, change urls and set permissions, install dependencies, run.
+
+
+
 ## Hardware decoder options
 
 The app defaults to Intel VA-API (`vaapih264dec`) in the GStreamer pipeline. You can switch to another decoder if your hardware supports it.
@@ -389,9 +396,7 @@ If you want a larger preview grid, you can adjust:
 THUMB_W, THUMB_H = 256, 144
 ```
 
-## Human explanation: 
 
-Assuming you already have go2rtc installed, Copy script to your PC, make changes applicable to your hardware, change urls and set permissions, install dependencies, run
 
 ## Changes:
 
