@@ -26,7 +26,7 @@ gi.require_version("Gst", "1.0")
 from gi.repository import Gtk, Gdk, Gst, GLib, GObject
 
 
-# ── Config ─────────────────────────────────────────────────────────────
+# ── Config ────────────────────────────────────────────────────────────
 
 CAMERAS = [
     ("rtsp://127.0.0.1:8554/RFC_sub", "RFC", "RFC"),
@@ -36,6 +36,8 @@ CAMERAS = [
     ("rtsp://127.0.0.1:8554/CC_sub",  "CC",  "CC"),
     ("rtsp://127.0.0.1:8554/SC_sub",  "SC",  "SC"),
     ("rtsp://127.0.0.1:8554/BC_sub", "BC", "BC"),
+    ("rtsp://127.0.0.1:8554/Tapo1_sub", "Tapo1", "Tapo 1"),
+    ("rtsp://127.0.0.1:8554/Tapo2_sub", "Tapo2", "Tapo 2"),
 ]
 
 THUMB_W, THUMB_H = 256, 144
@@ -55,12 +57,15 @@ DECODER = "vaapih264dec"  # decodebin | vaapih264dec | nvh264dec
 # Silent error strings
 SILENT_ERRORS = ("Not found", "not found", "Could not open resource", "Internal data stream error")
 
-# PTZ camera SSH config — add all 4 P/T cameras here
+# PTZ camera SSH config — add all 4 P/T cameras here. The two Tapo ONVIF cameras
+# are included here so the PTZ selector and panel show them as selectable controls.
 PTZ_CAMERAS = {
     "CC":   {"ip": "192.168.254.118", "user": "root", "password": "PW"},
     "SHOP": {"ip": "192.168.254.116", "user": "root", "password": "PW"},
     "GD":   {"ip": "192.168.254.119", "user": "root", "password": "PW"},
     "sd":   {"ip": "192.168.254.117", "user": "root", "password": "PW"},
+    "Tapo1": {"ip": "192.168.254.120", "user": "root", "password": "PW"},
+    "Tapo2": {"ip": "192.168.254.121", "user": "root", "password": "PW"},
 }
 
 PTZ_STEP = 50   # motor steps per button click
@@ -84,7 +89,7 @@ def open_in_browser(go2rtc_name: str):
     )
 
 
-# ── PTZ via SSH ───────────────────────────────────────────────────────────
+# ── PTZ via SSH ──────────────────────────────────────────────────────────
 
 def _ptz_ssh(ip, user, password, cmd):
     """Run a motors command on the camera via SSH."""
@@ -125,7 +130,7 @@ class PTZButton(Gtk.Button):
         ))
 
 
-# ── GStreamer pipeline ─────────────────────────────────────────────────────────
+# ── GStreamer pipeline ───────────────────────────────────────────────────────
 
 class CameraStream(GObject.Object):
 
@@ -265,7 +270,7 @@ class CameraStream(GObject.Object):
         self._stop()
 
 
-# ── Thumbnail tile ──────────────────────────────────────────────────────────
+# ── Thumbnail tile ─────────────────────────────────────────────────────────
 
 class CameraTile(Gtk.Box):
 
@@ -278,7 +283,7 @@ class CameraTile(Gtk.Box):
         self.add_css_class("camera-tile")
 
         overlay = Gtk.Overlay()
-        
+
         self._picture = Gtk.Picture()
         self._picture.set_size_request(THUMB_W, THUMB_H)
         self._picture.set_content_fit(Gtk.ContentFit.FILL)
@@ -360,7 +365,7 @@ scrolledwindow { background: transparent; }
 """
 
 
-# ── Main window ────────────────────────────────────────────────────────────
+# ── Main window ──────────────────────────────────────────────────────────
 
 class RTSPViewer(Gtk.ApplicationWindow):
 
@@ -382,13 +387,13 @@ class RTSPViewer(Gtk.ApplicationWindow):
         # Camera tiles
         for i, (sub_url, go2rtc_name, label) in enumerate(urls):
             tile = CameraTile(i, sub_url, label)
-            
+
             gesture = Gtk.GestureClick()
             gesture.set_button(1)
             gesture.connect("pressed", lambda g, n, x, y, name=go2rtc_name: 
                            n == 2 and open_in_browser(name))
             tile.add_controller(gesture)
-            
+
             self._tiles.append(tile)
             box.append(tile)
 
@@ -415,7 +420,7 @@ class RTSPViewer(Gtk.ApplicationWindow):
         controls.set_row_spacing(2)
         controls.set_column_spacing(2)
         controls.set_halign(Gtk.Align.CENTER)
-        
+
         buttons = [
             (PTZButton("▲", y=-PTZ_STEP, viewer=self), 1, 0),
             (PTZButton("◀", x=-PTZ_STEP, viewer=self), 0, 1),
