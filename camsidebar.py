@@ -28,6 +28,8 @@ from gi.repository import Gtk, Gdk, Gst, GLib, GObject
 
 # ── Config ────────────────────────────────────────────────────────────
 
+SHOW_CAMERA_VIDEO = False
+
 CAMERAS = [
     ("rtsp://127.0.0.1:8554/RFC_sub", "RFC", "RFC"),
     ("rtsp://127.0.0.1:8554/230_sub", "230", "230"),
@@ -319,6 +321,13 @@ class CameraTile(Gtk.Box):
         self.append(overlay)
 
     def start_stream(self):
+        if not SHOW_CAMERA_VIDEO:
+            self._picture.set_visible(False)
+            self._placeholder.set_label(f"Video disabled\n{self.url}")
+            self._placeholder.set_visible(True)
+            self._dot.set_visible(False)
+            return
+
         self._placeholder.set_label("Connecting…")
         self._stream = CameraStream(self.url)
         self._stream.connect("paintable-ready", self._on_paintable)
