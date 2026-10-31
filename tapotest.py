@@ -1,0 +1,615 @@
+#!/usr/bin/env python3
+"""
+camsidebar.py — camera RTSP viewer for Ubuntu 24.04/26.04 Wayland
+
+- Hardware decode via Intel VA-API (vaapih264dec)
+- go2rtc substreams at 640x360, scaled to 256x144 for thumbnails
+- 2-second stagger between camera startups
+- Silent retry on transient startup errors
+- Click tile → new Waterfox tab via go2rtc WebRTC
+- CC has pan/tilt controls via SSH motors command
+
+Dependencies:
+    sudo apt install \
+        python3-gi python3-gi-cairo gir1.2-gtk-4.0 \
+        gstreamer1.0-plugins-base gstreamer1.0-plugins-good \
+        gstreamer1.0-plugins-bad gstreamer1.0-plugins-ugly \
+        gstreamer1.0-rtsp gstreamer1.0-vaapi python3-gst-1.0
+"""
+
+import base64
+import hashlib
+import re
+import secrets
+import subprocess
+import threading
+import time
+import urllib.error
+import urllib.request
+from datetime import datetime, timezone
+
+import gi
+gi.require_version("Gtk", "4.0")
+gi.require_version("Gst", "1.0")
+from gi.repository import Gtk, Gdk, Gst, GLib, GObject
+
+
+# ── Config ─────────────────────────────────────────────────────────────
+
+CAMERAS = [
+    ("rtsp://127.0.0.1:8554/RFC_sub", "RFC", "RFC"),
+    ("rtsp://127.0.0.1:8554/230_sub", "230", "230"),
+    ("rtsp://127.0.0.1:8554/BD_sub",  "BD",  "BD"),
+    ("rtsp://127.0.0.1:8554/DC_sub",  "DC",  "DC"),
+    ("rtsp://127.0.0.1:8554/V_sub",  "V",  "V"),
+    ("rtsp://127.0.0.1:8554/sd_sub",  "sd",  "sd"),
+    ("rtsp://127.0.0.1:8554/CC_sub",  "CC",  "CC"),
+]
+
+THUMB_W, THUMB_H = 256, 144
+
+RECONNECT_DELAY      = 7    # seconds before reconnect after error
+STARTUP_RETRY        = 3    # seconds before silent retry on startup error
+STAGGER_DELAY        = 2    # seconds between each camera starting
+PERIODIC_RECONNECT   = 0    # seconds — force reconnect on schedule (0 = disabled)
+FREEZE_DETECT        = 10   # seconds — reconnect if no new frame received (0 = disabled)
+
+GO2RTC_BASE = "http://127.0.0.1:1984/stream.html?mode=webrtc&src="
+
+# Set by installer — change manually if needed
+BROWSER = "waterfox"   # waterfox | firefox | chromium | google-chrome
+DECODER = "vaapih264dec"  # decodebin | vaapih264dec | nvh264dec
+
+# Silent error strings
+SILENT_ERRORS = ("Not found", "not found", "Could not open resource", "Internal data stream error")
+
+# P/T cameras. Entries without "type" are Thingino cameras controlled over SSH.
+# Entries with "type": "onvif" are controlled with ONVIF (WS-Security) on "port".
+PTZ_CAMERAS = {
+    "CC":   {"ip": "192.168.254.118", "user": "root", "password": "test1234"},
+    "Q5":   {"ip": "192.168.254.98", "user": "root", "password": "test1234"},
+    "SHOP": {"ip": "192.168.254.116", "user": "root", "password": "test1234"},
+    "GD":   {"ip": "192.168.254.119", "user": "root", "password": "test1234"},
+    "sd":   {"ip": "192.168.254.117", "user": "root", "password": "test1234"},
+    "smirf":    {"type": "onvif", "ip": "192.168.254.95", "port": 2020,
+                 "user": "tapoc236", "password": "tapoc236"},
+    "Tapoc236": {"type": "onvif", "ip": "192.168.254.36", "port": 2020,
+                 "user": "tapoc236", "password": "tapoc236"},
+}
+
+PTZ_STEP = 50   # motor steps per button click (SSH cameras)
+
+# ONVIF cameras: each click moves at this speed (0.0-1.0) for this many seconds, then stops
+PTZ_ONVIF_SPEED = 0.25
+PTZ_ONVIF_TIME  = 0.15
+PTZ_ONVIF_TIMEOUT = 4   # seconds to wait for the camera to answer
+
+
+_sink_counter = 0
+
+
+def _unique_sink_name():
+    global _sink_counter
+    _sink_counter += 1
+    return f"sink{_sink_counter}"
+
+
+def open_in_browser(go2rtc_name: str):
+    """Open the go2rtc WebRTC stream page as a new tab."""
+    subprocess.Popen(
+        [BROWSER, "--new-tab", GO2RTC_BASE + go2rtc_name],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+
+# ── PTZ via SSH ───────────────────────────────────────────────────────────
+
+def _ptz_ssh(ip, user, password, cmd):
+    """Run a motors command on the camera via SSH."""
+    subprocess.run(
+        [
+            "sshpass", "-p", password,
+            "ssh", "-o", "StrictHostKeyChecking=no",
+            "-o", "ConnectTimeout=3",
+            f"{user}@{ip}", cmd,
+        ],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+
+# ── PTZ via ONVIF ─────────────────────────────────────────────────────────
+
+_onvif_profiles = {}   # label -> profile token (fetched once from the camera)
+_onvif_locks = {}      # label -> Lock, so rapid clicks are sent one at a time
+
+
+def _wsse_header(user, password):
+    """WS-Security UsernameToken with a fresh nonce and PasswordDigest."""
+    nonce = secrets.token_bytes(16)
+    created = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    digest = base64.b64encode(
+        hashlib.sha1(nonce + created.encode() + password.encode()).digest()
+    ).decode()
+    return (
+        '<wsse:Security xmlns:wsse="http://docs.oasis-open.org/wss/2004/01/'
+        'oasis-200401-wss-wssecurity-secext-1.0.xsd" '
+        'xmlns:wsu="http://docs.oasis-open.org/wss/2004/01/'
+        'oasis-200401-wss-wssecurity-utility-1.0.xsd">'
+        '<wsse:UsernameToken>'
+        f'<wsse:Username>{user}</wsse:Username>'
+        '<wsse:Password Type="http://docs.oasis-open.org/wss/2004/01/'
+        'oasis-200401-wss-username-token-profile-1.0#PasswordDigest">'
+        f'{digest}</wsse:Password>'
+        '<wsse:Nonce EncodingType="http://docs.oasis-open.org/wss/2004/01/'
+        'oasis-200401-wss-soap-message-security-1.0#Base64Binary">'
+        f'{base64.b64encode(nonce).decode()}</wsse:Nonce>'
+        f'<wsu:Created>{created}</wsu:Created>'
+        '</wsse:UsernameToken></wsse:Security>'
+    )
+
+
+def _onvif_call(cfg, body):
+    """POST one SOAP request to the camera's ONVIF service and return the reply text."""
+    envelope = (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        '<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope" '
+        'xmlns:tptz="http://www.onvif.org/ver20/ptz/wsdl" '
+        'xmlns:trt="http://www.onvif.org/ver10/media/wsdl" '
+        'xmlns:tt="http://www.onvif.org/ver10/schema">'
+        f'<s:Header>{_wsse_header(cfg["user"], cfg["password"])}</s:Header>'
+        f'<s:Body>{body}</s:Body></s:Envelope>'
+    ).encode()
+    req = urllib.request.Request(
+        f'http://{cfg["ip"]}:{cfg.get("port", 80)}/onvif/service',
+        data=envelope, method="POST",
+        headers={"Content-Type": "application/soap+xml; charset=utf-8"},
+    )
+    with urllib.request.urlopen(req, timeout=PTZ_ONVIF_TIMEOUT) as resp:
+        return resp.read().decode(errors="replace")
+
+
+def _onvif_profile(label, cfg):
+    """Profile token: from the config if given, otherwise asked from the camera once."""
+    if cfg.get("profile"):
+        return cfg["profile"]
+    if label not in _onvif_profiles:
+        reply = _onvif_call(cfg, "<trt:GetProfiles/>")
+        m = re.search(r'Profiles[^>]*\btoken="([^"]+)"', reply)
+        if not m:
+            raise RuntimeError("camera returned no profile token")
+        _onvif_profiles[label] = m.group(1)
+    return _onvif_profiles[label]
+
+
+def _ptz_onvif(label, cfg, pan, tilt):
+    """Move at PTZ_ONVIF_SPEED for PTZ_ONVIF_TIME seconds, then stop."""
+    lock = _onvif_locks.setdefault(label, threading.Lock())
+    with lock:
+        try:
+            token = _onvif_profile(label, cfg)
+            _onvif_call(cfg,
+                f"<tptz:ContinuousMove><tptz:ProfileToken>{token}</tptz:ProfileToken>"
+                f'<tptz:Velocity><tt:PanTilt x="{pan * PTZ_ONVIF_SPEED}" '
+                f'y="{tilt * PTZ_ONVIF_SPEED}"/></tptz:Velocity></tptz:ContinuousMove>')
+            time.sleep(PTZ_ONVIF_TIME)
+            _onvif_call(cfg,
+                f"<tptz:Stop><tptz:ProfileToken>{token}</tptz:ProfileToken>"
+                "<tptz:PanTilt>true</tptz:PanTilt><tptz:Zoom>true</tptz:Zoom></tptz:Stop>")
+        except urllib.error.HTTPError as e:
+            detail = e.read().decode(errors="replace")[:300]
+            print(f"[ptz] {label}: HTTP {e.code} {detail}", flush=True)
+        except Exception as e:
+            print(f"[ptz] {label}: {e}", flush=True)
+
+
+def ptz_move(label, x=0, y=0):
+    if not (cfg := PTZ_CAMERAS.get(label)):
+        return
+    if cfg.get("type") == "onvif":
+        # Buttons use motor-step signs (negative y = up); ONVIF tilt is positive = up.
+        pan = (x > 0) - (x < 0)
+        tilt = -((y > 0) - (y < 0))
+        threading.Thread(target=_ptz_onvif, args=(label, cfg, pan, tilt),
+                         daemon=True).start()
+        return
+    cmd = f"motors -d g -{'x' if x else 'y'} {x or y}"
+    threading.Thread(
+        target=_ptz_ssh,
+        args=(cfg["ip"], cfg["user"], cfg["password"], cmd),
+        daemon=True,
+    ).start()
+
+
+class PTZButton(Gtk.Button):
+    """Send motors command via SSH on each click."""
+
+    def __init__(self, label, x=0.0, y=0.0, viewer=None):
+        super().__init__(label=label)
+        self.add_css_class("ptz-button")
+        self._x, self._y = x, y
+        self._viewer = viewer
+        self.connect("clicked", lambda _: ptz_move(
+            self._viewer._ptz_target if self._viewer else list(PTZ_CAMERAS.keys())[0],
+            self._x, self._y
+        ))
+
+
+# ── GStreamer pipeline ─────────────────────────────────────────────────────────
+
+class CameraStream(GObject.Object):
+
+    __gsignals__ = {
+        "paintable-ready": (GObject.SignalFlags.RUN_FIRST, None, (object,)),
+        "stream-error": (GObject.SignalFlags.RUN_FIRST, None, (str,)),
+    }
+
+    def __init__(self, url: str):
+        super().__init__()
+        self.url = url
+        self._pipe = self._bus = None
+        self._retry = self._refresh = self._freeze_timer = None
+        self._has_frame = False
+        self._build()
+
+    def _reset_freeze_timer(self):
+        """Restart the freeze watchdog — called on every new frame."""
+        if FREEZE_DETECT <= 0:
+            return
+        if self._freeze_timer:
+            GLib.source_remove(self._freeze_timer)
+        self._freeze_timer = GLib.timeout_add_seconds(FREEZE_DETECT, self._on_freeze)
+
+    def _on_freeze(self):
+        """No frame received in FREEZE_DETECT seconds — stream is frozen."""
+        self._freeze_timer = None
+        print(f"[freeze] {self.url} — reconnecting", flush=True)
+        self._schedule_reconnect("frozen", startup=False)
+        return GLib.SOURCE_REMOVE
+
+    def _start_periodic(self):
+        """Start a periodic forced reconnect to prevent freeze."""
+        if PERIODIC_RECONNECT > 0 and not self._refresh:
+            self._refresh = GLib.timeout_add_seconds(PERIODIC_RECONNECT, self._do_periodic)
+
+    def _do_periodic(self):
+        """Force pipeline restart on schedule regardless of stream state."""
+        self._refresh = None
+        self._stop()
+        self._has_frame = False
+        self._build()
+        return GLib.SOURCE_REMOVE
+
+    def _build(self):
+        sink_name = _unique_sink_name()
+        desc = (
+            f"rtspsrc location={self.url} protocols=tcp "
+            f"latency=100 drop-on-latency=true do-rtsp-keep-alive=true ! "
+            f"rtph264depay ! h264parse ! {DECODER} ! "
+            f"videoconvert ! videoscale ! "
+            f"video/x-raw,width={THUMB_W},height={THUMB_H} ! "
+            f"gtk4paintablesink name={sink_name} sync=false"
+        )
+
+        try:
+            self._pipe = Gst.parse_launch(desc)
+        except GLib.Error as exc:
+            print(f"[pipeline error] {self.url}: {exc}", flush=True)
+            self._schedule_reconnect(str(exc), startup=True)
+            return
+
+        sink = self._pipe.get_by_name(sink_name)
+        if sink:
+            paintable = sink.get_property("paintable")
+            GLib.idle_add(self._emit_paintable, paintable)
+
+            # Probe every frame to drive freeze detection
+            if sink_pad := sink.get_static_pad("sink"):
+                sink_pad.add_probe(Gst.PadProbeType.BUFFER, self._on_buffer, None)
+
+        self._bus = self._pipe.get_bus()
+        self._bus.add_signal_watch()
+        self._bus.connect("message::error", self._on_error)
+        self._bus.connect("message::eos", self._on_eos)
+        self._pipe.set_state(Gst.State.PLAYING)
+
+    def _on_buffer(self, pad, info, data):
+        """Called on every decoded frame — resets freeze watchdog."""
+        if self._has_frame:
+            GLib.idle_add(self._reset_freeze_timer)
+        return Gst.PadProbeReturn.OK
+
+    def _emit_paintable(self, paintable):
+        if not self._has_frame:
+            self._has_frame = True
+            self._start_periodic()
+        self._reset_freeze_timer()
+        self.emit("paintable-ready", paintable)
+        return GLib.SOURCE_REMOVE
+
+    def _on_error(self, bus, msg):
+        err, _ = msg.parse_error()
+        err_str = str(err)
+        is_silent = any(x in err_str for x in SILENT_ERRORS)
+
+        if self._has_frame:
+            if not is_silent:
+                print(f"[gst error] {self.url}: {err}", flush=True)
+            self._schedule_reconnect(err_str, startup=False)
+        else:
+            self._schedule_reconnect(err_str, startup=True)
+
+    def _on_eos(self, bus, msg):
+        print(f"[eos] {self.url}", flush=True)
+        self._schedule_reconnect("EOS", startup=False)
+
+    def _schedule_reconnect(self, reason: str, startup: bool):
+        self.emit("stream-error", reason)
+        self._stop()
+        if not self._retry:
+            delay = STARTUP_RETRY if startup else RECONNECT_DELAY
+            self._retry = GLib.timeout_add_seconds(delay, self._do_reconnect)
+
+    def _do_reconnect(self):
+        self._retry = None
+        self._has_frame = False
+        self._build()
+        return GLib.SOURCE_REMOVE
+
+    def _stop(self):
+        if self._freeze_timer:
+            GLib.source_remove(self._freeze_timer)
+            self._freeze_timer = None
+        if self._bus:
+            self._bus.remove_signal_watch()
+            self._bus = None
+        if self._pipe:
+            self._pipe.set_state(Gst.State.NULL)
+            self._pipe = None
+
+    def destroy(self):
+        for timer in (self._retry, self._refresh, self._freeze_timer):
+            if timer:
+                GLib.source_remove(timer)
+        self._retry = self._refresh = self._freeze_timer = None
+        self._stop()
+
+
+# ── Thumbnail tile ──────────────────────────────────────────────────────────
+
+class CameraTile(Gtk.Box):
+
+    def __init__(self, index: int, url: str, label: str):
+        super().__init__(orientation=Gtk.Orientation.VERTICAL)
+        self.index, self.url = index, url
+        self._stream = None
+
+        self.set_size_request(THUMB_W, THUMB_H)
+        self.add_css_class("camera-tile")
+
+        overlay = Gtk.Overlay()
+        
+        self._picture = Gtk.Picture()
+        self._picture.set_size_request(THUMB_W, THUMB_H)
+        self._picture.set_content_fit(Gtk.ContentFit.FILL)
+        self._picture.set_can_target(False)
+        overlay.set_child(self._picture)
+
+        # Label
+        lbl = Gtk.Label(label=f"{index + 1}  {label}")
+        for cls in ("cam-label",):
+            lbl.add_css_class(cls)
+        lbl.set_halign(Gtk.Align.START)
+        lbl.set_valign(Gtk.Align.END)
+        lbl.set_can_target(False)
+        overlay.add_overlay(lbl)
+
+        # Status dot
+        self._dot = Gtk.Label(label="●")
+        self._dot.add_css_class("status-dot")
+        self._dot.add_css_class("connecting")
+        self._dot.set_halign(Gtk.Align.END)
+        self._dot.set_valign(Gtk.Align.START)
+        self._dot.set_can_target(False)
+        overlay.add_overlay(self._dot)
+
+        # Placeholder
+        self._placeholder = Gtk.Label(label=f"Starting…\n{label}")
+        self._placeholder.add_css_class("placeholder")
+        self._placeholder.set_wrap(True)
+        self._placeholder.set_justify(Gtk.Justification.CENTER)
+        self._placeholder.set_can_target(False)
+        overlay.add_overlay(self._placeholder)
+
+        self.append(overlay)
+
+    def start_stream(self):
+        self._placeholder.set_label("Connecting…")
+        self._stream = CameraStream(self.url)
+        self._stream.connect("paintable-ready", self._on_paintable)
+        self._stream.connect("stream-error", self._on_stream_error)
+
+    def _on_paintable(self, stream, paintable):
+        self._picture.set_paintable(paintable)
+        self._placeholder.set_visible(False)
+        self._set_dot("ok")
+
+    def _on_stream_error(self, stream, msg):
+        self._placeholder.set_label("Reconnecting…")
+        self._placeholder.set_visible(True)
+        self._set_dot("error")
+
+    def _set_dot(self, state):
+        for s in ("ok", "connecting", "error"):
+            self._dot.remove_css_class(s)
+        self._dot.add_css_class(state)
+
+    def destroy_stream(self):
+        if self._stream:
+            self._stream.destroy()
+            self._stream = None
+
+
+# ── CSS ────────────────────────────────────────────────────────────
+
+CSS = b"""
+window { background-color: #0d0d0d; }
+.camera-tile { padding: 0; border-radius: 0; border: 1px solid #252525; background: #111; }
+.camera-tile:hover { border-color: #4af; }
+.cam-label { font-family: monospace; font-size: 11px; color: #ccc; padding: 3px 6px; background: rgba(0,0,0,.6); }
+.status-dot { font-size: 10px; padding: 4px 6px; }
+.status-dot.ok { color: #3f3; }
+.status-dot.connecting { color: #fa0; }
+.status-dot.error { color: #f44; }
+.placeholder { font-size: 11px; color: #555; padding: 8px; }
+.ptz-sel-btn { font-family: monospace; font-size: 10px; padding: 2px 6px; background: #222; color: #aaa; border: 1px solid #333; border-radius: 3px; }
+.ptz-sel-btn:checked { background: #1e3a5a; color: #4af; border-color: #4af; }
+.ptz-panel { padding: 6px; margin-top: 2px; border: 1px solid #252525; background: #111; }
+.ptz-button { min-width: 29px; min-height: 23px; padding: 0; font-size: 8px; }
+scrolledwindow { background: transparent; }
+"""
+
+
+# ── Main window ────────────────────────────────────────────────────────────
+
+class RTSPViewer(Gtk.ApplicationWindow):
+
+    def __init__(self, app, urls):
+        super().__init__(application=app, title="Cameras")
+        self.set_decorated(False)
+        self.set_default_size(THUMB_W, 1050)
+
+        self._cameras = urls
+        self._tiles = []
+
+        scroll = Gtk.ScrolledWindow()
+        scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+        for margin_attr in ("top", "bottom", "start", "end"):
+            getattr(box, f"set_margin_{margin_attr}")(2)
+
+        # Camera tiles
+        for i, (sub_url, go2rtc_name, label) in enumerate(urls):
+            tile = CameraTile(i, sub_url, label)
+            
+            gesture = Gtk.GestureClick()
+            gesture.set_button(1)
+            gesture.connect("pressed", lambda g, n, x, y, name=go2rtc_name: 
+                           n == 2 and open_in_browser(name))
+            tile.add_controller(gesture)
+            
+            self._tiles.append(tile)
+            box.append(tile)
+
+        # PTZ controls
+        ptz_panel = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        ptz_panel.set_valign(Gtk.Align.CENTER)
+        ptz_panel.add_css_class("ptz-panel")
+
+        self._ptz_target = next(iter(PTZ_CAMERAS))
+
+        # Camera selector
+        selector = Gtk.Grid()
+        selector.set_row_spacing(2)
+        selector.set_column_spacing(2)
+        selector.set_halign(Gtk.Align.CENTER)
+        for i, cam_name in enumerate(PTZ_CAMERAS):
+            btn = Gtk.ToggleButton(label=cam_name)
+            btn.add_css_class("ptz-sel-btn")
+            btn.set_active(cam_name == self._ptz_target)
+            btn.connect("clicked", self._on_ptz_select, cam_name, selector)
+            selector.attach(btn, i % 4, i // 4, 1, 1)
+        ptz_panel.append(selector)
+
+        # D-pad
+        controls = Gtk.Grid()
+        controls.set_row_spacing(2)
+        controls.set_column_spacing(2)
+        controls.set_halign(Gtk.Align.CENTER)
+        
+        buttons = [
+            (PTZButton("▲", y=-PTZ_STEP, viewer=self), 1, 0),
+            (PTZButton("◀", x=-PTZ_STEP, viewer=self), 0, 1),
+            (PTZButton("▶", x=PTZ_STEP, viewer=self), 2, 1),
+            (PTZButton("▼", y=PTZ_STEP, viewer=self), 1, 2),
+        ]
+        for btn, col, row in buttons:
+            controls.attach(btn, col, row, 1, 1)
+
+        ptz_panel.append(controls)
+        box.append(ptz_panel)
+
+        scroll.set_child(box)
+        self.set_child(scroll)
+
+        # Stagger camera startups
+        for i, tile in enumerate(self._tiles):
+            if delay := i * STAGGER_DELAY:
+                GLib.timeout_add_seconds(delay, self._start_tile, i)
+            else:
+                tile.start_stream()
+
+        key = Gtk.EventControllerKey()
+        key.connect("key-pressed", self._on_key)
+        self.add_controller(key)
+
+    def _on_ptz_select(self, btn, cam_name, selector):
+        self._ptz_target = cam_name
+        child = selector.get_first_child()
+        while child:
+            child.set_active(child.get_label() == cam_name)
+            child = child.get_next_sibling()
+
+    def _start_tile(self, index):
+        self._tiles[index].start_stream()
+        return GLib.SOURCE_REMOVE
+
+    def _on_key(self, ctrl, keyval, keycode, state):
+        if keyval == Gdk.KEY_Escape:
+            self.get_application().quit()
+            return True
+        return False
+
+    def cleanup(self):
+        for tile in self._tiles:
+            tile.destroy_stream()
+
+
+# ── App ────────────────────────────────────────────────────────────
+
+class App(Gtk.Application):
+
+    def __init__(self, urls):
+        super().__init__(application_id="com.example.rtspviewer")
+        self._urls = urls
+        self._win = None
+
+    def do_activate(self):
+        provider = Gtk.CssProvider()
+        provider.load_from_data(CSS)
+        Gtk.StyleContext.add_provider_for_display(
+            Gdk.Display.get_default(),
+            provider,
+            Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION
+        )
+
+        self._win = RTSPViewer(self, self._urls)
+        self._win.connect("close-request", self._on_close)
+        self._win.present()
+
+    def _on_close(self, win):
+        if self._win:
+            self._win.cleanup()
+        self.quit()
+        return False
+
+
+def main():
+    Gst.init(None)
+    App(CAMERAS).run(None)
+
+
+if __name__ == "__main__":
+    main()
