@@ -388,7 +388,7 @@ firefox http://127.0.0.1:1984/stream.html?mode=webrtc&src=RFC
 
 ## Performance notes
 
-This app is intended for a modest number of cameras. The thumbnail pipeline uses low-resolution substreams and a staggered start to avoid large resource spikes. By default the app uses 256x144 thumbnail streams for responsiveness.
+This app is intended for a modest number of cameras (example uses 7). The thumbnail pipeline uses low-resolution substreams and a staggered start to avoid large resource spikes. By default the app uses 256x144 thumbnail streams for responsiveness.
 
 If you want a larger preview grid, you can adjust:
 
@@ -401,7 +401,7 @@ THUMB_W, THUMB_H = 256, 144
 ## Changes:
 
 Removed title bar..must use super key+left mouse button to position. Added freeze detection.
-Changed to doubleclick to open fullscreen, added nice _n 10 to launcher, improve handling of inactive cameras
+Changed to doubleclick to open fullscreen, added nice _n 10 to launcher, improve handling of inactive cameras, added onvif P/T controls
 
 ## License
 
