@@ -34,7 +34,7 @@ gi.require_version("Gst", "1.0")
 from gi.repository import Gtk, Gdk, Gst, GLib, GObject
 
 
-# ── Config ─────────────────────────────────────────────────────────────
+# ── Config ────────────────────────────────────────────────────────────[...]
 
 CAMERAS = [
     ("rtsp://127.0.0.1:8554/RFC_sub", "RFC", "RFC"),
@@ -94,16 +94,33 @@ def _unique_sink_name():
     return f"sink{_sink_counter}"
 
 
+def _wait_for_go2rtc(timeout=12.0, poll=0.25):
+    """Block until the go2rtc web UI answers, so the browser tab opens after startup completes."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            with urllib.request.urlopen("http://127.0.0.1:1984/", timeout=1.0) as resp:
+                if resp.status == 200:
+                    return True
+        except Exception:
+            pass
+        time.sleep(poll)
+    return False
+
+
 def open_in_browser(go2rtc_name: str):
-    """Open the go2rtc WebRTC stream page as a new tab."""
+    """Open the go2rtc WebRTC stream page as a new tab only after go2rtc is ready."""
+    _wait_for_go2rtc()
+    url = GO2RTC_BASE + go2rtc_name
     subprocess.Popen(
-        [BROWSER, "--new-tab", GO2RTC_BASE + go2rtc_name],
+        [BROWSER, "--new-tab", url],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
+        start_new_session=True,
     )
 
 
-# ── PTZ via SSH ───────────────────────────────────────────────────────────
+# ── PTZ via SSH ──────────────────────────────────────────────────────────[...]
 
 def _ptz_ssh(ip, user, password, cmd):
     """Run a motors command on the camera via SSH."""
@@ -236,7 +253,7 @@ class PTZButton(Gtk.Button):
         ))
 
 
-# ── GStreamer pipeline ─────────────────────────────────────────────────────────
+# ── GStreamer pipeline ────────────────────────────────────────────────────────
 
 class CameraStream(GObject.Object):
 
@@ -389,7 +406,7 @@ class CameraTile(Gtk.Box):
         self.add_css_class("camera-tile")
 
         overlay = Gtk.Overlay()
-        
+
         self._picture = Gtk.Picture()
         self._picture.set_size_request(THUMB_W, THUMB_H)
         self._picture.set_content_fit(Gtk.ContentFit.FILL)
@@ -471,7 +488,7 @@ scrolledwindow { background: transparent; }
 """
 
 
-# ── Main window ────────────────────────────────────────────────────────────
+# ── Main window ──────────────────────────────────────────────────────────[...]
 
 class RTSPViewer(Gtk.ApplicationWindow):
 
@@ -493,13 +510,13 @@ class RTSPViewer(Gtk.ApplicationWindow):
         # Camera tiles
         for i, (sub_url, go2rtc_name, label) in enumerate(urls):
             tile = CameraTile(i, sub_url, label)
-            
+
             gesture = Gtk.GestureClick()
             gesture.set_button(1)
-            gesture.connect("pressed", lambda g, n, x, y, name=go2rtc_name: 
+            gesture.connect("pressed", lambda g, n, x, y, name=go2rtc_name:
                            n == 2 and open_in_browser(name))
             tile.add_controller(gesture)
-            
+
             self._tiles.append(tile)
             box.append(tile)
 
@@ -528,7 +545,7 @@ class RTSPViewer(Gtk.ApplicationWindow):
         controls.set_row_spacing(2)
         controls.set_column_spacing(2)
         controls.set_halign(Gtk.Align.CENTER)
-        
+
         buttons = [
             (PTZButton("▲", y=-PTZ_STEP, viewer=self), 1, 0),
             (PTZButton("◀", x=-PTZ_STEP, viewer=self), 0, 1),
