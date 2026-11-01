@@ -11,7 +11,7 @@ It is intended to work with go2rtc and RTSP streams, using lightweight 640x360 s
 - go2rtc-based RTSP substreams
 - Automatic reconnect retries
 - Click a camera tile to open a full stream in a browser
-- Optional PTZ control using SSH commands
+- Optional PTZ control using SSH or onvif
 - Lightweight 256x144 thumbnail stream previews
 
 ## Requirements
