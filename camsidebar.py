@@ -17,16 +17,25 @@ Dependencies:
         gstreamer1.0-rtsp gstreamer1.0-vaapi python3-gst-1.0
 """
 
+import base64
+import hashlib
+import re
+import secrets
 import subprocess
 import threading
+import time
+import urllib.error
+import urllib.request
+from datetime import datetime, timezone
 
 import gi
+
 gi.require_version("Gtk", "4.0")
 gi.require_version("Gst", "1.0")
 from gi.repository import Gtk, Gdk, Gst, GLib, GObject
 
 
-# ── Config ─────────────────────────────────────────────────────────────
+# ── Config ────────────────────────────────────────────────────────────
 
 CAMERAS = [
     ("rtsp://127.0.0.1:8554/RFC_sub", "RFC", "RFC"),
@@ -36,6 +45,8 @@ CAMERAS = [
     ("rtsp://127.0.0.1:8554/CC_sub",  "CC",  "CC"),
     ("rtsp://127.0.0.1:8554/SC_sub",  "SC",  "SC"),
     ("rtsp://127.0.0.1:8554/BC_sub", "BC", "BC"),
+    ("rtsp://127.0.0.1:8554/Tapo1_sub", "Tapo1", "Tapo 1"),
+    ("rtsp://127.0.0.1:8554/Tapo2_sub", "Tapo2", "Tapo 2"),
 ]
 
 THUMB_W, THUMB_H = 256, 144
@@ -46,7 +57,7 @@ STAGGER_DELAY        = 2    # seconds between each camera starting
 PERIODIC_RECONNECT   = 0    # seconds — force reconnect on schedule (0 = disabled)
 FREEZE_DETECT        = 10   # seconds — reconnect if no new frame received (0 = disabled)
 
-GO2RTC_BASE = "http://192.168.254.4:1984/stream.html?mode=webrtc&src="
+GO2RTC_BASE = "http://127.0.0.1:1984/stream.html?mode=webrtc&src="
 
 # Set by installer — change manually if needed
 BROWSER = "waterfox"   # waterfox | firefox | chromium | google-chrome
@@ -55,15 +66,29 @@ DECODER = "vaapih264dec"  # decodebin | vaapih264dec | nvh264dec
 # Silent error strings
 SILENT_ERRORS = ("Not found", "not found", "Could not open resource", "Internal data stream error")
 
-# PTZ camera SSH config — add all 4 P/T cameras here
+# P/T cameras. Entries without "type" are Thingino cameras controlled over SSH.
+# Entries with "type": "onvif" are controlled with ONVIF (WS-Security) on "port".
 PTZ_CAMERAS = {
     "CC":   {"ip": "192.168.254.118", "user": "root", "password": "PW"},
     "SHOP": {"ip": "192.168.254.116", "user": "root", "password": "PW"},
     "GD":   {"ip": "192.168.254.119", "user": "root", "password": "PW"},
     "sd":   {"ip": "192.168.254.117", "user": "root", "password": "PW"},
+    "Tapo1": {"type": "onvif", "ip": "192.168.254.120", "port": 2020,
+              "user": "tapoc236", "password": "tapoc236"},
+    "Tapo2": {"type": "onvif", "ip": "192.168.254.121", "port": 2020,
+              "user": "tapoc236", "password": "tapoc236"},
+    "smirf": {"type": "onvif", "ip": "192.168.254.95", "port": 2020,
+              "user": "tapoc236", "password": "tapoc236"},
+    "Tapoc236": {"type": "onvif", "ip": "192.168.254.36", "port": 2020,
+                 "user": "tapoc236", "password": "tapoc236"},
 }
 
-PTZ_STEP = 50   # motor steps per button click
+PTZ_STEP = 50   # motor steps per button click (SSH cameras)
+
+# ONVIF cameras: each click moves at this speed (0.0-1.0) for this many seconds, then stops
+PTZ_ONVIF_SPEED = 0.25
+PTZ_ONVIF_TIME  = 0.15
+PTZ_ONVIF_TIMEOUT = 4   # seconds to wait for the camera to answer
 
 
 _sink_counter = 0
@@ -75,16 +100,34 @@ def _unique_sink_name():
     return f"sink{_sink_counter}"
 
 
+def _wait_for_go2rtc(timeout=12.0, poll=0.25):
+    """Block until the go2rtc web UI answers, so the browser tab opens after startup completes."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            with urllib.request.urlopen("http://127.0.0.1:1984/", timeout=1.0) as resp:
+                if resp.status == 200:
+                    return True
+        except Exception:
+            pass
+        time.sleep(poll)
+    return False
+
+
 def open_in_browser(go2rtc_name: str):
-    """Open the go2rtc WebRTC stream page as a new tab."""
+    """Open the go2rtc WebRTC stream page as a new tab only after go2rtc is ready."""
+    _wait_for_go2rtc()
+    url = GO2RTC_BASE + go2rtc_name
     subprocess.Popen(
-        [BROWSER, "--new-tab", GO2RTC_BASE + go2rtc_name],
+        [BROWSER, "--new-tab", url],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
+        start_new_session=True,
     )
 
 
-# ── PTZ via SSH ───────────────────────────────────────────────────────────
+# ── PTZ via SSH ──────────────────────────────────────────────────────────
+
 
 def _ptz_ssh(ip, user, password, cmd):
     """Run a motors command on the camera via SSH."""
@@ -100,8 +143,100 @@ def _ptz_ssh(ip, user, password, cmd):
     )
 
 
+# ── PTZ via ONVIF ─────────────────────────────────────────────────────────
+
+_onvif_profiles = {}   # label -> profile token (fetched once from the camera)
+_onvif_locks = {}      # label -> Lock, so rapid clicks are sent one at a time
+
+
+def _wsse_header(user, password):
+    """WS-Security UsernameToken with a fresh nonce and PasswordDigest."""
+    nonce = secrets.token_bytes(16)
+    created = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    digest = base64.b64encode(
+        hashlib.sha1(nonce + created.encode() + password.encode()).digest()
+    ).decode()
+    return (
+        '<wsse:Security xmlns:wsse="http://docs.oasis-open.org/wss/2004/01/'
+        'oasis-200401-wss-wssecurity-secext-1.0.xsd" '
+        'xmlns:wsu="http://docs.oasis-open.org/wss/2004/01/'
+        'oasis-200401-wss-wssecurity-utility-1.0.xsd">'
+        '<wsse:UsernameToken>'
+        f'<wsse:Username>{user}</wsse:Username>'
+        '<wsse:Password Type="http://docs.oasis-open.org/wss/2004/01/'
+        'oasis-200401-wss-username-token-profile-1.0#PasswordDigest">'
+        f'{digest}</wsse:Password>'
+        '<wsse:Nonce EncodingType="http://docs.oasis-open.org/wss/2004/01/'
+        'oasis-200401-wss-soap-message-security-1.0#Base64Binary">'
+        f'{base64.b64encode(nonce).decode()}</wsse:Nonce>'
+        f'<wsu:Created>{created}</wsu:Created>'
+        '</wsse:UsernameToken></wsse:Security>'
+    )
+
+
+def _onvif_call(cfg, body):
+    """POST one SOAP request to the camera's ONVIF service and return the reply text."""
+    envelope = (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        '<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope" '
+        'xmlns:tptz="http://www.onvif.org/ver20/ptz/wsdl" '
+        'xmlns:trt="http://www.onvif.org/ver10/media/wsdl" '
+        'xmlns:tt="http://www.onvif.org/ver10/schema">'
+        f'<s:Header>{_wsse_header(cfg["user"], cfg["password"])}</s:Header>'
+        f'<s:Body>{body}</s:Body></s:Envelope>'
+    ).encode()
+    req = urllib.request.Request(
+        f'http://{cfg["ip"]}:{cfg.get("port", 80)}/onvif/service',
+        data=envelope, method="POST",
+        headers={"Content-Type": "application/soap+xml; charset=utf-8"},
+    )
+    with urllib.request.urlopen(req, timeout=PTZ_ONVIF_TIMEOUT) as resp:
+        return resp.read().decode(errors="replace")
+
+
+def _onvif_profile(label, cfg):
+    """Profile token: from the config if given, otherwise asked from the camera once."""
+    if cfg.get("profile"):
+        return cfg["profile"]
+    if label not in _onvif_profiles:
+        reply = _onvif_call(cfg, "<trt:GetProfiles/>")
+        m = re.search(r'Profiles[^>]*\btoken="([^"]+)"', reply)
+        if not m:
+            raise RuntimeError("camera returned no profile token")
+        _onvif_profiles[label] = m.group(1)
+    return _onvif_profiles[label]
+
+
+def _ptz_onvif(label, cfg, pan, tilt):
+    """Move at PTZ_ONVIF_SPEED for PTZ_ONVIF_TIME seconds, then stop."""
+    lock = _onvif_locks.setdefault(label, threading.Lock())
+    with lock:
+        try:
+            token = _onvif_profile(label, cfg)
+            _onvif_call(cfg,
+                f"<tptz:ContinuousMove><tptz:ProfileToken>{token}</tptz:ProfileToken>"
+                f'<tptz:Velocity><tt:PanTilt x="{pan * PTZ_ONVIF_SPEED}" '
+                f'y="{tilt * PTZ_ONVIF_SPEED}"/></tptz:Velocity></tptz:ContinuousMove>')
+            time.sleep(PTZ_ONVIF_TIME)
+            _onvif_call(cfg,
+                f"<tptz:Stop><tptz:ProfileToken>{token}</tptz:ProfileToken>"
+                "<tptz:PanTilt>true</tptz:PanTilt><tptz:Zoom>true</tptz:Zoom></tptz:Stop>")
+        except urllib.error.HTTPError as e:
+            detail = e.read().decode(errors="replace")[:300]
+            print(f"[ptz] {label}: HTTP {e.code} {detail}", flush=True)
+        except Exception as e:
+            print(f"[ptz] {label}: {e}", flush=True)
+
+
 def ptz_move(label, x=0, y=0):
     if not (cfg := PTZ_CAMERAS.get(label)):
+        return
+    if cfg.get("type") == "onvif":
+        # Buttons use motor-step signs (negative y = up); ONVIF tilt is positive = up.
+        pan = (x > 0) - (x < 0)
+        tilt = -((y > 0) - (y < 0))
+        threading.Thread(target=_ptz_onvif, args=(label, cfg, pan, tilt),
+                         daemon=True).start()
         return
     cmd = f"motors -d g -{'x' if x else 'y'} {x or y}"
     threading.Thread(
@@ -112,7 +247,7 @@ def ptz_move(label, x=0, y=0):
 
 
 class PTZButton(Gtk.Button):
-    """Send motors command via SSH on each click."""
+    """Send motors command via SSH or ONVIF on each click."""
 
     def __init__(self, label, x=0.0, y=0.0, viewer=None):
         super().__init__(label=label)
@@ -125,7 +260,7 @@ class PTZButton(Gtk.Button):
         ))
 
 
-# ── GStreamer pipeline ─────────────────────────────────────────────────────────
+# ── GStreamer pipeline ───────────────────────────────────────────────────────
 
 class CameraStream(GObject.Object):
 
@@ -265,7 +400,7 @@ class CameraStream(GObject.Object):
         self._stop()
 
 
-# ── Thumbnail tile ──────────────────────────────────────────────────────────
+# ── Thumbnail tile ─────────────────────────────────────────────────────────
 
 class CameraTile(Gtk.Box):
 
@@ -278,7 +413,7 @@ class CameraTile(Gtk.Box):
         self.add_css_class("camera-tile")
 
         overlay = Gtk.Overlay()
-        
+
         self._picture = Gtk.Picture()
         self._picture.set_size_request(THUMB_W, THUMB_H)
         self._picture.set_content_fit(Gtk.ContentFit.FILL)
@@ -360,7 +495,7 @@ scrolledwindow { background: transparent; }
 """
 
 
-# ── Main window ────────────────────────────────────────────────────────────
+# ── Main window ──────────────────────────────────────────────────────────
 
 class RTSPViewer(Gtk.ApplicationWindow):
 
@@ -382,13 +517,13 @@ class RTSPViewer(Gtk.ApplicationWindow):
         # Camera tiles
         for i, (sub_url, go2rtc_name, label) in enumerate(urls):
             tile = CameraTile(i, sub_url, label)
-            
+
             gesture = Gtk.GestureClick()
             gesture.set_button(1)
-            gesture.connect("pressed", lambda g, n, x, y, name=go2rtc_name: 
+            gesture.connect("pressed", lambda g, n, x, y, name=go2rtc_name:
                            n == 2 and open_in_browser(name))
             tile.add_controller(gesture)
-            
+
             self._tiles.append(tile)
             box.append(tile)
 
@@ -400,14 +535,16 @@ class RTSPViewer(Gtk.ApplicationWindow):
         self._ptz_target = next(iter(PTZ_CAMERAS))
 
         # Camera selector
-        selector = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=2)
+        selector = Gtk.Grid()
+        selector.set_row_spacing(2)
+        selector.set_column_spacing(2)
         selector.set_halign(Gtk.Align.CENTER)
-        for cam_name in PTZ_CAMERAS:
+        for i, cam_name in enumerate(PTZ_CAMERAS):
             btn = Gtk.ToggleButton(label=cam_name)
             btn.add_css_class("ptz-sel-btn")
             btn.set_active(cam_name == self._ptz_target)
             btn.connect("clicked", self._on_ptz_select, cam_name, selector)
-            selector.append(btn)
+            selector.attach(btn, i % 4, i // 4, 1, 1)
         ptz_panel.append(selector)
 
         # D-pad
@@ -415,7 +552,7 @@ class RTSPViewer(Gtk.ApplicationWindow):
         controls.set_row_spacing(2)
         controls.set_column_spacing(2)
         controls.set_halign(Gtk.Align.CENTER)
-        
+
         buttons = [
             (PTZButton("▲", y=-PTZ_STEP, viewer=self), 1, 0),
             (PTZButton("◀", x=-PTZ_STEP, viewer=self), 0, 1),
